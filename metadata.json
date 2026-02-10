@@ -1,0 +1,5 @@
+{
+  "name": "Gemini Reader & Creator",
+  "description": "An intelligent application that reads documents and URLs aloud, explaining visuals, and features a high-quality image generator.",
+  "requestFramePermissions": []
+}
