@@ -1,11 +1,74 @@
 import { GoogleGenAI, Modality, Type } from "@google/genai";
-import { ReadingSegment } from "../types";
+import { ReadingSegment, Chapter } from "../types";
 import { decodeAudioData } from "../utils/audioUtils";
 
-// Initialize Gemini Client
-// Note: For Image Gen (Pro model), we might re-instantiate with a user-selected key in the component.
 const createAiClient = (apiKey: string = process.env.API_KEY || '') => {
   return new GoogleGenAI({ apiKey });
+};
+
+// 0. Generate Document Structure (Chapters)
+export const generateChapters = async (docText: string, isPdf: boolean): Promise<Chapter[]> => {
+    const ai = createAiClient();
+    const prompt = `
+      You are an expert document structurer. Analyze the provided text which represents a ${isPdf ? 'PDF document (with PAGE markers)' : 'Web Article'}.
+      Create a logical Table of Contents (Chapters).
+
+      Rules:
+      1. Identify major sections, headings, or logical breaks.
+      2. If it's a PDF, use the "--- PAGE X ---" markers to determine startPage and endPage for each chapter.
+      3. If it's a Web Article, just create sections based on H1/H2 topics.
+      4. Ensure every part of the document is covered in a chapter.
+      5. Return a JSON array.
+
+      Response Schema:
+      Array<{ title: string, startPage: number, endPage: number }>
+      (Note: for Web, startPage/endPage can be 0).
+    `;
+
+    // Truncate for structure analysis to avoid huge context costs, though 1.5/2.5 Flash handles 1M.
+    // Let's safe limit to ~200k chars for structure.
+    const safeText = docText.substring(0, 200000);
+
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-3-flash-preview',
+            contents: {
+                parts: [
+                    { text: safeText },
+                    { text: prompt }
+                ]
+            },
+            config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                    type: Type.ARRAY,
+                    items: {
+                        type: Type.OBJECT,
+                        properties: {
+                            title: { type: Type.STRING },
+                            startPage: { type: Type.INTEGER },
+                            endPage: { type: Type.INTEGER }
+                        },
+                        required: ['title', 'startPage', 'endPage']
+                    }
+                }
+            }
+        });
+
+        const text = response.text;
+        if (!text) return [{ id: '1', title: 'Full Document', startPage: 1, endPage: 1 }];
+
+        const parsed = JSON.parse(text);
+        return parsed.map((item: any) => ({
+            ...item,
+            id: Math.random().toString(36).substring(7)
+        }));
+
+    } catch (e) {
+        console.error("Structure analysis failed", e);
+        // Fallback
+        return [{ id: '1', title: 'Main Content', startPage: 1, endPage: 1 }];
+    }
 };
 
 // 1. Analyze Page Content (Text + Visuals)
@@ -72,21 +135,19 @@ export const analyzePageContent = async (base64Image: string): Promise<ReadingSe
   }
 };
 
-// 2. Analyze HTML Content (from URL)
+// 2. Analyze HTML Content (from URL or EPUB)
 export const analyzeHtmlContent = async (htmlContent: string): Promise<ReadingSegment[]> => {
   const ai = createAiClient();
-  
-  // Truncate HTML if it's too massive to avoid token limits, though Flash context is large.
-  // 100k chars is usually a safe rough limit for a simple demo.
-  const safeContent = htmlContent.substring(0, 100000);
+  // Increase limit to 500k for larger chapters
+  const safeContent = htmlContent.substring(0, 500000);
 
   const prompt = `
-    You are an intelligent reading assistant. Analyze this HTML content from a website.
-    Break down the main article or page content into a sequential reading script.
+    You are an intelligent reading assistant. Analyze this HTML content.
+    Break down the content into a sequential reading script.
     
     Rules:
-    1. Extract the main body text in reading order. IGNORE navigation menus, footers, sidebars, and ads.
-    2. If you encounter an image tag with meaningful alt text or context that suggests a visual (like a chart or diagram), create a 'visual_description' block explaining it.
+    1. Extract the main body text in reading order. IGNORE navigation menus, footers, sidebars.
+    2. If you encounter an image tag with meaningful alt text or context that suggests a visual, create a 'visual_description' block explaining it.
        - Try to extract the image 'src' URL and return it as 'imageUrl'.
     3. Return ONLY a JSON array.
 
@@ -165,18 +226,11 @@ export const generateSpeech = async (text: string, audioCtx: AudioContext): Prom
 export const generateImagePro = async (
   prompt: string, 
   size: '1K' | '2K' | '4K', 
-  apiKey: string // Must pass explicit key for this high-end model flow
+  apiKey: string
 ): Promise<string | null> => {
   const ai = new GoogleGenAI({ apiKey });
   
-  // Size mapping if needed, but 1K/2K/4K are standard params for this model usually, 
-  // or we map to specific dims. The system prompt says "Supported values are 1K, 2K, and 4K".
-  
   try {
-    // Note: Use generateContent for gemini-3-pro-image-preview as per system prompt instructions
-    // "Call generateContent to generate images with nano banana series models" -> but 3-pro-image-preview is high quality.
-    // The prompt says: "Upgrade to 'gemini-3-pro-image-preview' if the user requests high-quality images"
-    
     const response = await ai.models.generateContent({
       model: 'gemini-3-pro-image-preview',
       contents: {
@@ -184,13 +238,12 @@ export const generateImagePro = async (
       },
       config: {
         imageConfig: {
-          aspectRatio: "1:1", // Defaulting to square, can be option
+          aspectRatio: "1:1",
           imageSize: size
         }
       }
     });
 
-    // Iterate to find image part
     for (const part of response.candidates?.[0]?.content?.parts || []) {
       if (part.inlineData) {
         return `data:image/png;base64,${part.inlineData.data}`;

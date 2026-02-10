@@ -26,6 +26,27 @@ export async function renderPdfPage(pdf: any, pageNumber: number): Promise<strin
     return cleanBase64;
 }
 
+// Extract raw text from the entire PDF for structure analysis
+export async function extractPdfText(pdf: any): Promise<{ fullText: string; pageMap: string[] }> {
+  const numPages = pdf.numPages;
+  let fullText = "";
+  const pageMap: string[] = []; // index = page number - 1
+
+  // Limit initial extraction to ~50 pages to prevent browser lockup on massive docs
+  const limit = Math.min(numPages, 50);
+
+  for (let i = 1; i <= limit; i++) {
+    const page = await pdf.getPage(i);
+    const tokenizedText = await page.getTextContent();
+    const pageText = tokenizedText.items.map((token: any) => token.str).join(' ');
+    
+    pageMap.push(pageText);
+    fullText += `--- PAGE ${i} ---\n${pageText}\n`;
+  }
+
+  return { fullText, pageMap };
+}
+
 export async function cropImageFromBase64(base64: string, bbox: number[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -67,7 +88,7 @@ export async function cropImageFromBase64(base64: string, bbox: number[]): Promi
   });
 }
 
-// Deprecated but kept for compatibility if needed elsewhere, though Reader.tsx will now use the functions above
+// Deprecated but kept for compatibility
 export async function convertPdfToImages(file: File): Promise<string[]> {
   const pdf = await loadPdfDocument(file);
   const numPages = pdf.numPages;

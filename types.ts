@@ -7,6 +7,14 @@ export interface ReadingSegment {
   imageUrl?: string; // Base64 for PDF crops, URL for Web images
 }
 
+export interface Chapter {
+  id: string;
+  title: string;
+  startPage: number; // For PDF (1-based)
+  endPage: number;   // For PDF
+  content?: string;  // For URL/HTML mode
+}
+
 export interface PdfPageData {
   pageNumber: number;
   imageUrl: string;
@@ -32,7 +40,5 @@ declare global {
 
   interface Window {
     pdfjsLib: any;
-    // aistudio is already defined on Window with type AIStudio in the environment
-    // We removed the conflicting property declaration here.
   }
 }
