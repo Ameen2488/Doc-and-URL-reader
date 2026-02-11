@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { analyzePageContent, analyzeHtmlContent, generateSpeech, generateChapters } from '../services/geminiService';
 import { loadPdfDocument, renderPdfPage, cropImageFromBase64, extractPdfText } from '../utils/pdfUtils';
 import { loadEpubDocument, extractEpubChapters, getEpubChapterContent } from '../utils/epubUtils';
-import { ReadingSegment, Chapter } from '../types';
+import { ReadingSegment, Chapter, Bookmark } from '../types';
 
 export const Reader: React.FC = () => {
   const [inputMode, setInputMode] = useState<'file' | 'url'>('file');
@@ -25,20 +25,45 @@ export const Reader: React.FC = () => {
   const [audioContext, setAudioContext] = useState<AudioContext | null>(null);
   const [hasSavedState, setHasSavedState] = useState(false);
   
+  // Bookmarks State
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [sidebarTab, setSidebarTab] = useState<'chapters' | 'bookmarks'>('chapters');
+  
   // Audio Settings
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.0);
   const [volume, setVolume] = useState<number>(1.0);
   const [showSettings, setShowSettings] = useState(false);
   const [showSidebar, setShowSidebar] = useState(true); // Default open on desktop
   
-  // Refs
+  // Refs for State (To avoid stale closures in recursive audio callbacks)
+  const segmentsRef = useRef<ReadingSegment[]>([]);
+  const chaptersRef = useRef<Chapter[]>([]);
+  const currentChapterRef = useRef<Chapter | null>(null);
+  const isPlayingRef = useRef<boolean>(false);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
   const segmentRefs = useRef<{ [key: string]: HTMLDivElement | null }>({});
+  const pendingAudioRequests = useRef<Set<string>>(new Set());
+  
+  // Computed
+  const currentDocId = inputMode === 'file' ? pdfFileName : urlInput;
+
+  // Sync refs with state
+  useEffect(() => { segmentsRef.current = segments; }, [segments]);
+  useEffect(() => { chaptersRef.current = chapters; }, [chapters]);
+  useEffect(() => { currentChapterRef.current = currentChapter; }, [currentChapter]);
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
 
   useEffect(() => {
     const saved = localStorage.getItem('gemini_reader_progress');
     if (saved) setHasSavedState(true);
+
+    const savedBookmarks = localStorage.getItem('gemini_reader_bookmarks');
+    if (savedBookmarks) {
+        try {
+            setBookmarks(JSON.parse(savedBookmarks));
+        } catch(e) { console.error("Failed to load bookmarks"); }
+    }
   }, []);
 
   // Audio Logic Update Hooks
@@ -70,6 +95,77 @@ export const Reader: React.FC = () => {
     if (audioSourceRef.current) {
         try { audioSourceRef.current.stop(); } catch(e) {}
     }
+    pendingAudioRequests.current.clear();
+  };
+
+  // --- Bookmarking Logic ---
+
+  const toggleBookmark = (segmentIndex: number) => {
+      if (!currentChapter) return;
+      const segment = segments[segmentIndex];
+      if (!segment) return;
+
+      const existingIndex = bookmarks.findIndex(b => 
+          b.docId === currentDocId && 
+          b.chapterId === currentChapter.id && 
+          b.segmentIndex === segmentIndex
+      );
+
+      let newBookmarks;
+      if (existingIndex >= 0) {
+          // Remove
+          newBookmarks = bookmarks.filter((_, i) => i !== existingIndex);
+      } else {
+          // Add
+          const newBookmark: Bookmark = {
+              id: Math.random().toString(36).substring(7),
+              docId: currentDocId,
+              chapterId: currentChapter.id,
+              chapterTitle: currentChapter.title,
+              segmentIndex: segmentIndex,
+              preview: segment.content.substring(0, 60) + (segment.content.length > 60 ? '...' : ''),
+              timestamp: Date.now()
+          };
+          newBookmarks = [newBookmark, ...bookmarks];
+      }
+
+      setBookmarks(newBookmarks);
+      localStorage.setItem('gemini_reader_bookmarks', JSON.stringify(newBookmarks));
+  };
+
+  const handleBookmarkClick = async (bookmark: Bookmark) => {
+      // If different doc, we can't really switch easily without re-upload in this MVP
+      if (bookmark.docId !== currentDocId) {
+          alert(`This bookmark belongs to "${bookmark.docId}". Please load that document first.`);
+          return;
+      }
+
+      setIsPlaying(false);
+      
+      // If different chapter, load it first
+      if (currentChapter?.id !== bookmark.chapterId) {
+          const targetChapter = chapters.find(c => c.id === bookmark.chapterId);
+          if (targetChapter) {
+              await processChapter(targetChapter, fileType === 'pdf' ? pdfDoc : epubBook);
+          }
+      }
+
+      // Set index and scroll
+      // We rely on processChapter finishing and updating state/refs
+      // However, react state updates might be batched. 
+      // If we just loaded a chapter, we need to wait for segments to populate.
+      // processChapter is awaited, so segments should be ready in the next render cycle or if we return them.
+      
+      // Force a small timeout to ensure refs are updated if we just switched chapters
+      setTimeout(() => {
+          setCurrentSegmentIndex(bookmark.segmentIndex);
+          // Optional: Auto-play
+          // setIsPlaying(true);
+          // playSegment(bookmark.segmentIndex);
+      }, 100);
+      
+      // Close sidebar on mobile
+      if (window.innerWidth < 768) setShowSidebar(false);
   };
 
   // --- Core Processing Logic ---
@@ -135,10 +231,17 @@ export const Reader: React.FC = () => {
           }
 
           setSegments(newSegments);
+          // Prefetch first audio immediately after loading
+          if (newSegments.length > 0) {
+              const ctx = initAudio();
+              if (ctx) prefetchAudio(0, ctx, newSegments);
+          }
+          return newSegments;
 
       } catch (e) {
           console.error("Chapter processing failed", e);
           alert("Failed to load chapter content.");
+          return [];
       } finally {
           setIsLoading(false);
           setLoadingStep('');
@@ -165,13 +268,11 @@ export const Reader: React.FC = () => {
             setEpubBook(book);
             
             const extractedChapters = await extractEpubChapters(book);
-            // Map to our Chapter interface (add extra fields if needed)
             const mappedChapters: Chapter[] = extractedChapters.map((c: any) => ({
                 id: c.id,
                 title: c.title,
                 startPage: 0,
                 endPage: 0,
-                // store href in existing Chapter interface, maybe cast or assume logic uses it
                 ...c 
             }));
             
@@ -304,74 +405,133 @@ export const Reader: React.FC = () => {
       } catch(e) { console.error(e); }
   };
 
-  // --- Audio Logic (Play, Scroll, Advance) ---
+  // --- Audio Logic (Prefetch & Seamless Play) ---
+
+  const prefetchAudio = async (index: number, ctx: AudioContext, currentSegmentsOverride?: ReadingSegment[]) => {
+      // Use override if provided (e.g. during initial load), otherwise use ref
+      const segs = currentSegmentsOverride || segmentsRef.current;
+      if (!segs || !segs[index]) return;
+
+      const segment = segs[index];
+      // Check if already has buffer or is pending
+      if (segment.audioBuffer || pendingAudioRequests.current.has(segment.id)) return;
+
+      pendingAudioRequests.current.add(segment.id);
+      
+      try {
+          const buffer = await generateSpeech(segment.content, ctx);
+          if (buffer) {
+              setSegments(prev => prev.map(s => s.id === segment.id ? { ...s, audioBuffer: buffer } : s));
+          }
+      } catch (e) {
+          console.error("Prefetch failed for index", index, e);
+      } finally {
+          pendingAudioRequests.current.delete(segment.id);
+      }
+  };
   
   const playSegment = useCallback(async (index: number) => {
-    if (index >= segments.length) {
-        // End of chapter - Auto Advance?
-        const currentIdx = chapters.findIndex(c => c.id === currentChapter?.id);
-        if (currentIdx !== -1 && currentIdx < chapters.length - 1) {
+    // 1. Check Bounds & Auto-Advance
+    const currentSegments = segmentsRef.current; 
+    
+    if (index >= currentSegments.length) {
+        // End of chapter
+        const currentCh = currentChapterRef.current;
+        const allChapters = chaptersRef.current;
+        const currentIdx = allChapters.findIndex(c => c.id === currentCh?.id);
+        
+        if (currentIdx !== -1 && currentIdx < allChapters.length - 1) {
+            // Slight pause then move to next chapter
             setTimeout(() => {
-                const nextChapter = chapters[currentIdx + 1];
-                // Pass appropriate doc ref
-                processChapter(nextChapter, fileType === 'pdf' ? pdfDoc : null);
-            }, 1000);
+                const nextChapter = allChapters[currentIdx + 1];
+                // CAUTION: Automatic transition requires stable doc refs. 
+                // For simplicity in this demo, we stop. User can click next.
+                setIsPlaying(false);
+                setCurrentSegmentIndex(-1);
+            }, 500);
+        } else {
+            setIsPlaying(false);
+            setCurrentSegmentIndex(-1);
         }
-        setIsPlaying(false);
-        setCurrentSegmentIndex(-1);
         return;
     }
+    
     if (index < 0) return;
 
+    // 2. Init Audio
     const ctx = initAudio();
     if (!ctx) return;
     if (ctx.state === 'suspended') await ctx.resume();
 
+    // 3. Prefetch Next 2 Segments Immediately
+    prefetchAudio(index + 1, ctx);
+    prefetchAudio(index + 2, ctx);
+
+    // 4. Prepare Current Segment
     setCurrentSegmentIndex(index);
-    const segment = segments[index];
+    const segment = currentSegments[index];
+    let buffer = segment.audioBuffer;
 
-    try {
-        let buffer = segment.audioBuffer;
-        if (!buffer) {
-            const fetched = await generateSpeech(segment.content, ctx);
-            if (fetched) {
-                segment.audioBuffer = fetched;
-                buffer = fetched;
-                setSegments(prev => {
-                    const copy = [...prev];
-                    copy[index].audioBuffer = fetched;
-                    return copy;
-                });
-            }
-        }
-
-        if (buffer) {
-            if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
-            
-            const source = ctx.createBufferSource();
-            source.buffer = buffer;
-            source.playbackRate.value = playbackSpeed;
-
-            const gain = ctx.createGain();
-            gain.gain.value = volume;
-
-            source.connect(gain);
-            gain.connect(ctx.destination);
-
-            gainNodeRef.current = gain;
-            audioSourceRef.current = source;
-
-            source.addEventListener('ended', () => {
-                if (audioSourceRef.current === source) {
-                    playSegment(index + 1);
+    if (!buffer) {
+        // Buffer missing. Check if pending.
+        if (pendingAudioRequests.current.has(segment.id)) {
+            // Polling for buffer to arrive
+            let attempts = 0;
+            while (attempts < 50 && !buffer) { // Wait up to 5s
+                await new Promise(r => setTimeout(r, 100));
+                const updatedSeg = segmentsRef.current[index];
+                if (updatedSeg?.audioBuffer) {
+                    buffer = updatedSeg.audioBuffer;
+                    break;
                 }
-            });
-            source.start();
-        } else {
-            playSegment(index + 1);
+                attempts++;
+            }
+        } 
+        
+        // If still no buffer (wasn't pending, or polling timed out), fetch now
+        if (!buffer) {
+            pendingAudioRequests.current.add(segment.id);
+            try {
+                buffer = await generateSpeech(segment.content, ctx);
+                if (buffer) {
+                    const b = buffer; // capture
+                    setSegments(prev => prev.map(s => s.id === segment.id ? { ...s, audioBuffer: b } : s));
+                }
+            } catch(e) { console.error(e); }
+            pendingAudioRequests.current.delete(segment.id);
         }
-    } catch(e) { setIsPlaying(false); }
-  }, [segments, isPlaying, audioContext, playbackSpeed, volume, chapters, currentChapter, pdfDoc, epubBook, fileType]);
+    }
+
+    // 5. Play
+    if (buffer) {
+        if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
+        
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.playbackRate.value = playbackSpeed; 
+
+        const gain = ctx.createGain();
+        gain.gain.value = volume;
+
+        source.connect(gain);
+        gain.connect(ctx.destination);
+
+        gainNodeRef.current = gain;
+        audioSourceRef.current = source;
+
+        // Auto-play next using Ref to ensure we check latest state
+        source.onended = () => {
+             if (audioSourceRef.current === source && isPlayingRef.current) {
+                 playSegment(index + 1);
+             }
+        };
+
+        source.start();
+    } else {
+        // Failed to get audio, skip or stop
+        setIsPlaying(false);
+    }
+  }, [playbackSpeed, volume]); // Keep deps minimal, use refs for dynamic data
 
   const togglePlay = () => {
       if (segments.length === 0) return;
@@ -401,10 +561,12 @@ export const Reader: React.FC = () => {
     }
   }, [currentSegmentIndex, segments]);
 
+  const currentDocBookmarks = bookmarks.filter(b => b.docId === currentDocId);
+
   return (
     <div className="max-w-7xl mx-auto p-4 md:p-6 flex flex-col md:flex-row gap-6 min-h-[calc(100vh-100px)]">
       
-      {/* Sidebar: Chapters */}
+      {/* Sidebar: Chapters & Bookmarks */}
       <div className={`
          fixed md:sticky top-0 left-0 h-full md:h-auto z-40 bg-white md:bg-transparent
          w-64 transform transition-transform duration-300 ease-in-out border-r border-slate-200 md:border-none p-4 md:p-0
@@ -413,17 +575,31 @@ export const Reader: React.FC = () => {
       `}>
           <div className="mb-6 bg-white p-4 rounded-xl border border-slate-200 shadow-sm sticky top-24">
               <div className="flex justify-between items-center mb-4">
-                  <h3 className="font-bold text-slate-800">Chapters</h3>
-                  <button onClick={() => setShowSidebar(false)} className="md:hidden text-slate-400">
-                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                  <div className="flex gap-2 bg-slate-100 p-1 rounded-lg w-full">
+                      <button 
+                        onClick={() => setSidebarTab('chapters')}
+                        className={`flex-1 py-1 px-2 text-xs font-semibold rounded-md transition-all ${sidebarTab === 'chapters' ? 'bg-white shadow text-indigo-600' : 'text-slate-500'}`}
+                      >
+                        Chapters
+                      </button>
+                      <button 
+                        onClick={() => setSidebarTab('bookmarks')}
+                        className={`flex-1 py-1 px-2 text-xs font-semibold rounded-md transition-all ${sidebarTab === 'bookmarks' ? 'bg-white shadow text-indigo-600' : 'text-slate-500'}`}
+                      >
+                        Bookmarks
+                      </button>
+                  </div>
+                  <button onClick={() => setShowSidebar(false)} className="md:hidden text-slate-400 ml-2">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                   </button>
               </div>
               
-              {chapters.length === 0 ? (
-                  <p className="text-sm text-slate-400 italic">No document loaded.</p>
-              ) : (
-                  <div className="space-y-2 max-h-[70vh] overflow-y-auto pr-2 custom-scrollbar">
-                      {chapters.map((chap, idx) => (
+              <div className="space-y-2 max-h-[70vh] overflow-y-auto pr-2 custom-scrollbar">
+                  {sidebarTab === 'chapters' ? (
+                      chapters.length === 0 ? (
+                        <p className="text-sm text-slate-400 italic text-center py-4">No document loaded.</p>
+                      ) : (
+                        chapters.map((chap, idx) => (
                           <button
                             key={chap.id}
                             onClick={() => !isLoading && processChapter(chap, fileType === 'pdf' ? pdfDoc : epubBook)}
@@ -441,9 +617,33 @@ export const Reader: React.FC = () => {
                                   </div>
                               )}
                           </button>
-                      ))}
-                  </div>
-              )}
+                        ))
+                      )
+                  ) : (
+                      currentDocBookmarks.length === 0 ? (
+                        <p className="text-sm text-slate-400 italic text-center py-4">No bookmarks yet.</p>
+                      ) : (
+                        currentDocBookmarks.map((bm) => (
+                            <div key={bm.id} className="group relative bg-white border border-slate-100 rounded-lg p-3 hover:shadow-sm transition-all">
+                                <button
+                                    onClick={() => handleBookmarkClick(bm)}
+                                    className="text-left w-full"
+                                >
+                                    <div className="text-xs font-bold text-slate-800 mb-1 truncate">{bm.chapterTitle}</div>
+                                    <div className="text-xs text-slate-500 line-clamp-2">{bm.preview}</div>
+                                    <div className="text-[10px] text-slate-400 mt-2">{new Date(bm.timestamp).toLocaleDateString()}</div>
+                                </button>
+                                <button 
+                                    onClick={(e) => { e.stopPropagation(); toggleBookmark(bm.segmentIndex); }}
+                                    className="absolute top-2 right-2 text-rose-400 hover:text-rose-600 opacity-0 group-hover:opacity-100 transition-opacity"
+                                >
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path fillRule="evenodd" d="M16.5 4.478v.227a48.816 48.816 0 013.878.512.75.75 0 11-.49 1.45 47.362 47.362 0 00-7.618-1.213L8 16.64l.9 4.802a.75.75 0 11-1.472.28L6.87 18.9 4.3 19.5a.75.75 0 01-.355-1.458l.75-3.332-1.872-3.83a.75.75 0 011.08-1.026L5.5 11.2V4.478a2.252 2.252 0 012.25-2.25h8.505a2.25 2.25 0 012.25 2.25zM12.5 14h-3v-1.5a.75.75 0 01.22-.53l2.25-2.25a.75.75 0 111.06 1.06l-1.47 1.47v.75h.94a.75.75 0 010 1.5z" clipRule="evenodd" /></svg>
+                                </button>
+                            </div>
+                        ))
+                      )
+                  )}
+              </div>
           </div>
       </div>
 
@@ -533,27 +733,25 @@ export const Reader: React.FC = () => {
                  {/* Reading Script */}
                  <div className="p-6 md:p-8 space-y-6">
                      {segments.map((seg, idx) => (
-                         <div key={seg.id} ref={el => {segmentRefs.current[seg.id] = el}} onClick={() => { setIsPlaying(true); playSegment(idx); }} className={`p-4 rounded-xl cursor-pointer transition-all ${currentSegmentIndex === idx ? 'bg-indigo-50 border-l-4 border-indigo-500' : 'hover:bg-slate-50 border-l-4 border-transparent'}`}>
-                             {seg.type === 'visual_description' ? (
-                                 <div className="bg-amber-50 rounded-lg p-4 border border-amber-100">
-                                     {seg.imageUrl && <img src={seg.imageUrl} alt="Visual" className="mb-4 rounded-lg shadow-sm max-h-80 mx-auto object-contain bg-white" />}
-                                     <div className="flex gap-3 text-amber-900">
-                                         <svg className="w-5 h-5 flex-shrink-0 text-amber-500" fill="currentColor" viewBox="0 0 20 20"><path d="M10 12a2 2 0 100-4 2 2 0 000 4z" /><path fillRule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clipRule="evenodd" /></svg>
-                                         <div>
-                                            <div className="text-xs font-bold uppercase text-amber-600 mb-1">Visual Explained</div>
-                                            <p className="italic">{seg.content}</p>
-                                         </div>
-                                     </div>
-                                 </div>
-                             ) : (
-                                 <p className={`text-lg leading-relaxed ${currentSegmentIndex === idx ? 'text-slate-900 font-medium' : 'text-slate-600'}`}>{seg.content}</p>
-                             )}
-                         </div>
-                     ))}
-                 </div>
-             </div>
-         )}
-      </div>
-    </div>
-  );
-};
+                         <div key={seg.id} ref={el => {segmentRefs.current[seg.id] = el}} className={`group relative p-4 rounded-xl cursor-pointer transition-all ${currentSegmentIndex === idx ? 'bg-indigo-50 border-l-4 border-indigo-500' : 'hover:bg-slate-50 border-l-4 border-transparent'}`}>
+                             {/* Bookmark Button */}
+                             <button
+                                onClick={(e) => { e.stopPropagation(); toggleBookmark(idx); }}
+                                className={`absolute top-2 right-2 p-1.5 rounded-full z-10 transition-all ${
+                                    bookmarks.some(b => b.docId === currentDocId && b.chapterId === currentChapter?.id && b.segmentIndex === idx)
+                                    ? 'text-indigo-600 bg-indigo-100'
+                                    : 'text-slate-300 opacity-0 group-hover:opacity-100 hover:text-indigo-500 hover:bg-slate-100'
+                                }`}
+                                title="Bookmark this segment"
+                             >
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill={bookmarks.some(b => b.docId === currentDocId && b.chapterId === currentChapter?.id && b.segmentIndex === idx) ? "currentColor" : "none"} stroke="currentColor" strokeWidth={2} className="w-4 h-4">
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0111.186 0z" />
+                                </svg>
+                             </button>
+
+                             <div onClick={() => { setIsPlaying(true); playSegment(idx); }} className="w-full">
+                                {seg.type === 'visual_description' ? (
+                                    <div className="bg-amber-50 rounded-lg p-4 border border-amber-100">
+                                        {seg.imageUrl && <img src={seg.imageUrl} alt="Visual" className="mb-4 rounded-lg shadow-sm max-h-80 mx-auto object-contain bg-white" />}
+                                        <div className="flex gap-3 text-amber-900">
+                                            <svg className="w-5 h-5 flex-shrink-0 text-amber-500" fill="currentColor" viewBox="0 0 20 20"><path d="M10 12a2 2 0 100-4 2 2 0 000 4z" /><path fillRule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.2

@@ -30,6 +30,16 @@ export interface ImageGenerationConfig {
   size: '1K' | '2K' | '4K';
 }
 
+export interface Bookmark {
+  id: string;
+  docId: string;
+  chapterId: string;
+  chapterTitle: string;
+  segmentIndex: number;
+  preview: string;
+  timestamp: number;
+}
+
 // Augment window for PDF.js and AI Studio
 declare global {
   // Augment the existing AIStudio interface (or define it if missing but linked by Window)
